@@ -49,6 +49,7 @@ def parse_args_paired_training(input_args=None):
 
     # training details
     parser.add_argument("--output_dir", required=True)
+    parser.add_argument("--num_keep_latest", type=int, default=5)
     parser.add_argument("--cache_dir", default=None,)
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument("--resolution", type=int, default=512,)
@@ -143,6 +144,7 @@ def parse_args_unpaired_training():
     # args for validation and logging
     parser.add_argument("--viz_freq", type=int, default=20)
     parser.add_argument("--output_dir", type=str, required=True)
+    parser.add_argument("--num_keep_latest", type=int, default=5)
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--tracker_project_name", type=str, required=True)
     parser.add_argument("--validation_steps", type=int, default=500,)
@@ -176,6 +178,7 @@ def parse_args_unpaired_training():
     parser.add_argument("--gradient_checkpointing", action="store_true",
         help="Whether or not to use gradient checkpointing to save memory at the expense of slower backward pass.")
     parser.add_argument("--enable_xformers_memory_efficient_attention", action="store_true", help="Whether or not to use xformers.")
+    parser.add_argument("--resume", action="store_true", help="Load from the saved ckpts to continue training")
 
     args = parser.parse_args()
     return args

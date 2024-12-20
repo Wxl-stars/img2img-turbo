@@ -4,7 +4,9 @@ import copy
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, CLIPTextModel
-from diffusers import AutoencoderKL, UNet2DConditionModel
+from diffusers import UNet2DConditionModel
+# from diffusers import AutoencoderKL
+from autoencoder_kl import AutoencoderKL
 from peft import LoraConfig
 from peft.utils import get_peft_model_state_dict
 p = "src/"
