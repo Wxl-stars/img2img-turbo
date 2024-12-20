@@ -1,13 +1,18 @@
 import os
 import gc
 import copy
+import cv2
 import lpips
 import torch
 import wandb
+import shutil
 from glob import glob
 import numpy as np
+import refile, json
 from accelerate import Accelerator
 from accelerate.utils import set_seed
+from datetime import datetime
+from peft import LoraConfig
 from PIL import Image
 from torchvision import transforms
 from tqdm.auto import tqdm
@@ -16,17 +21,29 @@ from diffusers.optimization import get_scheduler
 from peft.utils import get_peft_model_state_dict
 from cleanfid.fid import get_folder_features, build_feature_extractor, frechet_distance
 import vision_aided_loss
+from inference_unpaired import concat_images
 from model import make_1step_sched
 from cyclegan_turbo import CycleGAN_Turbo, VAE_encode, VAE_decode, initialize_unet, initialize_vae
 from my_utils.training_utils import UnpairedDataset, build_transform, parse_args_unpaired_training
 from my_utils.dino_struct import DinoStructureLoss
+from private_dataset import PrivateUnpairedDataset
+
+# import torch._dynamo
+# torch._dynamo.config.dynamic_shapes = False
+# torch._dynamo.config.suppress_errors = True
 
 
 def main(args):
-    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, log_with=args.report_to)
+    accelerator = Accelerator(gradient_accumulation_steps=args.gradient_accumulation_steps, log_with=args.report_to, dynamo_backend="no")
     set_seed(args.seed)
 
+    time = datetime.now().strftime("%Y-%m-%d-%H-%M-%S")
+    args.output_dir += time
+
     if accelerator.is_main_process:
+        if args.report_to == "wandb":
+            wandb_api = "5ffda11e5559b630d501d1c448db3bd85fc5b14d"
+            wandb.login(key=wandb_api)
         os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
 
     tokenizer = AutoTokenizer.from_pretrained("stabilityai/sd-turbo", subfolder="tokenizer", revision=args.revision, use_fast=False,)
@@ -66,6 +83,34 @@ def main(args):
     vae_enc = VAE_encode(vae_a2b, vae_b2a=vae_b2a)
     vae_dec = VAE_decode(vae_a2b, vae_b2a=vae_b2a)
 
+
+    # if args.resume:
+    #     sd = torch.load(pretrained_path)
+    #     lora_conf_encoder = LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian", target_modules=sd["l_target_modules_encoder"], lora_alpha=sd["rank_unet"])
+    #     lora_conf_decoder = LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian", target_modules=sd["l_target_modules_decoder"], lora_alpha=sd["rank_unet"])
+    #     lora_conf_others = LoraConfig(r=sd["rank_unet"], init_lora_weights="gaussian", target_modules=sd["l_modules_others"], lora_alpha=sd["rank_unet"])
+    #     unet.add_adapter(lora_conf_encoder, adapter_name="default_encoder")
+    #     unet.add_adapter(lora_conf_decoder, adapter_name="default_decoder")
+    #     unet.add_adapter(lora_conf_others, adapter_name="default_others")
+    #     for n, p in unet.named_parameters():
+    #         name_sd = n.replace(".default_encoder.weight", ".weight")
+    #         if "lora" in n and "default_encoder" in n:
+    #             p.data.copy_(sd["sd_encoder"][name_sd])
+    #     for n, p in unet.named_parameters():
+    #         name_sd = n.replace(".default_decoder.weight", ".weight")
+    #         if "lora" in n and "default_decoder" in n:
+    #             p.data.copy_(sd["sd_decoder"][name_sd])
+    #     for n, p in unet.named_parameters():
+    #         name_sd = n.replace(".default_others.weight", ".weight")
+    #         if "lora" in n and "default_others" in n:
+    #             p.data.copy_(sd["sd_other"][name_sd])
+    #     unet.set_adapter(["default_encoder", "default_decoder", "default_others"])
+    #     vae_lora_config = LoraConfig(r=sd["rank_vae"], init_lora_weights="gaussian", target_modules=sd["vae_lora_target_modules"])
+    #     # vae_a2b.add_adapter(vae_lora_config, adapter_name="vae_skip")
+    #     # vae_enc = VAE_encode(self.vae, vae_b2a=self.vae_b2a)
+    #     vae_enc.load_state_dict(sd["sd_vae_enc"])
+    #     vae_dec.load_state_dict(sd["sd_vae_dec"])
+
     optimizer_gen = torch.optim.AdamW(params_gen, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay, eps=args.adam_epsilon,)
 
@@ -73,17 +118,32 @@ def main(args):
     optimizer_disc = torch.optim.AdamW(params_disc, lr=args.learning_rate, betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay, eps=args.adam_epsilon,)
 
-    dataset_train = UnpairedDataset(dataset_folder=args.dataset_folder, image_prep=args.train_img_prep, split="train", tokenizer=tokenizer)
+    # dataset_train = UnpairedDataset(dataset_folder=args.dataset_folder, image_prep=args.train_img_prep, split="train", tokenizer=tokenizer)
+    dataset_train = PrivateUnpairedDataset(
+        dataset_folder=args.dataset_folder, 
+        image_prep=args.train_img_prep,  
+        tokenizer=tokenizer,
+        fixed_caption_src="Driving on the road in daylight",
+        fixed_caption_tgt="Driving on the road at night. All cars turns on their lights and the street lights are on.",
+        )
+
     train_dataloader = torch.utils.data.DataLoader(dataset_train, batch_size=args.train_batch_size, shuffle=True, num_workers=args.dataloader_num_workers)
     T_val = build_transform(args.val_img_prep)
     fixed_caption_src = dataset_train.fixed_caption_src
     fixed_caption_tgt = dataset_train.fixed_caption_tgt
-    l_images_src_test = []
-    for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
-        l_images_src_test.extend(glob(os.path.join(args.dataset_folder, "test_A", ext)))
-    l_images_tgt_test = []
-    for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
-        l_images_tgt_test.extend(glob(os.path.join(args.dataset_folder, "test_B", ext)))
+
+    # prepare for test
+    # test_json_path = "s3://sdagent-shard-bj-baiducloud/wheeljack/wuxiaolei/img_translation/data/vlm_day_74976_night_6397.json"
+    test_json_path = "s3://sdagent-shard-bj-baiducloud/wheeljack/wuxiaolei/img_translation/data/vlm_day_71840_night_12025_2024-12-18_all.json"
+    json_data = json.load(refile.smart_open(test_json_path))
+    l_images_src_test = json_data["day"][:50]
+    l_images_tgt_test = json_data["night"][:50]
+    # l_images_src_test = []
+    # for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
+    #     l_images_src_test.extend(glob(os.path.join(args.dataset_folder, "test_A", ext)))
+    # l_images_tgt_test = []
+    # for ext in ["*.jpg", "*.jpeg", "*.png", "*.bmp"]:
+    #     l_images_tgt_test.extend(glob(os.path.join(args.dataset_folder, "test_B", ext)))
     l_images_src_test, l_images_tgt_test = sorted(l_images_src_test), sorted(l_images_tgt_test)
 
     # make the reference FID statistics
@@ -96,7 +156,10 @@ def main(args):
         os.makedirs(output_dir_ref, exist_ok=True)
         # transform all images according to the validation transform and save them
         for _path in tqdm(l_images_tgt_test):
-            _img = T_val(Image.open(_path).convert("RGB"))
+            _img = refile.smart_load_image(_path)
+            _img = cv2.cvtColor(_img, cv2.COLOR_BGR2RGB)
+            _img = Image.fromarray(_img)
+            _img = T_val(_img)
             outf = os.path.join(output_dir_ref, os.path.basename(_path)).replace(".jpg", ".png")
             if not os.path.exists(outf):
                 _img.save(outf)
@@ -113,7 +176,10 @@ def main(args):
         output_dir_ref = os.path.join(args.output_dir, "fid_reference_b2a")
         os.makedirs(output_dir_ref, exist_ok=True)
         for _path in tqdm(l_images_src_test):
-            _img = T_val(Image.open(_path).convert("RGB"))
+            _img = refile.smart_load_image(_path)
+            _img = cv2.cvtColor(_img, cv2.COLOR_BGR2RGB)
+            _img = Image.fromarray(_img)
+            _img = T_val(_img)
             outf = os.path.join(output_dir_ref, os.path.basename(_path)).replace(".jpg", ".png")
             if not os.path.exists(outf):
                 _img.save(outf)
@@ -273,7 +339,7 @@ def main(args):
                     eval_unet = accelerator.unwrap_model(unet)
                     eval_vae_enc = accelerator.unwrap_model(vae_enc)
                     eval_vae_dec = accelerator.unwrap_model(vae_dec)
-                    if global_step % args.viz_freq == 1:
+                    if global_step % args.viz_freq == 1 or (global_step > 10215 and global_step < 10225):
                         for tracker in accelerator.trackers:
                             if tracker.name == "wandb":
                                 viz_img_a = batch["pixel_values_src"].to(dtype=weight_dtype)
@@ -307,6 +373,18 @@ def main(args):
                         torch.save(sd, outf)
                         gc.collect()
                         torch.cuda.empty_cache()
+                        ckpt_list = glob(refile.smart_path_join(args.output_dir, "checkpoints", "model_*.pkl"))
+                        ckpt_list.sort(key=os.path.getmtime)
+                        if len(ckpt_list) > args.num_keep_latest:
+                            for cur_file_idx in range(0, len(ckpt_list) - args.num_keep_latest):
+                                os.remove(ckpt_list[cur_file_idx])
+                        # 删除fid dirs
+                        fid_dirs = glob(refile.smart_path_join(args.output_dir, "fid-*"))
+                        fid_dirs.sort(key=os.path.getmtime)
+                        if len(fid_dirs) > args.num_keep_latest:
+                            for cur_file_idx in range(0, len(fid_dirs) - args.num_keep_latest):
+                                shutil.rmtree(fid_dirs[cur_file_idx])
+                        
 
                     # compute val FID and DINO-Struct scores
                     if global_step % args.validation_steps == 1:
@@ -319,18 +397,24 @@ def main(args):
                         os.makedirs(fid_output_dir, exist_ok=True)
                         l_dino_scores_a2b = []
                         # get val input images from domain a
-                        for idx, input_img_path in enumerate(tqdm(l_images_src_test)):
+                        for idx, input_img_path in enumerate(tqdm(l_images_src_test, desc="[eval a2b...]")):
                             if idx > args.validation_num_images and args.validation_num_images > 0:
                                 break
                             outf = os.path.join(fid_output_dir, f"{idx}.png")
                             with torch.no_grad():
-                                input_img = T_val(Image.open(input_img_path).convert("RGB"))
+                                _img = refile.smart_load_image(input_img_path)
+                                _img = cv2.cvtColor(_img, cv2.COLOR_BGR2RGB)
+                                _img = Image.fromarray(_img)
+                                # input_img = T_val(Image.open(input_img_path).convert("RGB"))
+                                input_img = T_val(_img)
                                 img_a = transforms.ToTensor()(input_img)
                                 img_a = transforms.Normalize([0.5], [0.5])(img_a).unsqueeze(0).cuda()
                                 eval_fake_b = CycleGAN_Turbo.forward_with_networks(img_a, "a2b", eval_vae_enc, eval_unet,
                                     eval_vae_dec, noise_scheduler_1step, _timesteps, fixed_a2b_emb[0:1])
                                 eval_fake_b_pil = transforms.ToPILImage()(eval_fake_b[0] * 0.5 + 0.5)
-                                eval_fake_b_pil.save(outf)
+                                # eval_fake_b_pil.save(outf)
+                                fake_b_display = concat_images(_img, eval_fake_b_pil)
+                                fake_b_display.save(outf)
                                 a = net_dino.preprocess(input_img).unsqueeze(0).cuda()
                                 b = net_dino.preprocess(eval_fake_b_pil).unsqueeze(0).cuda()
                                 dino_ssim = net_dino.calculate_global_ssim_loss(a, b).item()
@@ -351,18 +435,24 @@ def main(args):
                         os.makedirs(fid_output_dir, exist_ok=True)
                         l_dino_scores_b2a = []
                         # get val input images from domain b
-                        for idx, input_img_path in enumerate(tqdm(l_images_tgt_test)):
+                        for idx, input_img_path in enumerate(tqdm(l_images_tgt_test, desc="[eval b2a...]")):
                             if idx > args.validation_num_images and args.validation_num_images > 0:
                                 break
                             outf = os.path.join(fid_output_dir, f"{idx}.png")
                             with torch.no_grad():
-                                input_img = T_val(Image.open(input_img_path).convert("RGB"))
+                                _img = refile.smart_load_image(input_img_path)
+                                _img = cv2.cvtColor(_img, cv2.COLOR_BGR2RGB)
+                                _img = Image.fromarray(_img)
+                                # input_img = T_val(Image.open(input_img_path).convert("RGB"))
+                                input_img = T_val(_img)
                                 img_b = transforms.ToTensor()(input_img)
                                 img_b = transforms.Normalize([0.5], [0.5])(img_b).unsqueeze(0).cuda()
                                 eval_fake_a = CycleGAN_Turbo.forward_with_networks(img_b, "b2a", eval_vae_enc, eval_unet,
                                     eval_vae_dec, noise_scheduler_1step, _timesteps, fixed_b2a_emb[0:1])
                                 eval_fake_a_pil = transforms.ToPILImage()(eval_fake_a[0] * 0.5 + 0.5)
-                                eval_fake_a_pil.save(outf)
+                                # eval_fake_a_pil.save(outf)
+                                fake_a_display = concat_images(_img, eval_fake_a_pil)
+                                fake_a_display.save(outf)
                                 a = net_dino.preprocess(input_img).unsqueeze(0).cuda()
                                 b = net_dino.preprocess(eval_fake_a_pil).unsqueeze(0).cuda()
                                 dino_ssim = net_dino.calculate_global_ssim_loss(a, b).item()
@@ -388,3 +478,15 @@ def main(args):
 if __name__ == "__main__":
     args = parse_args_unpaired_training()
     main(args)
+
+
+# accelerate launch --main_process_port 29501 src/train_cyclegan_turbo.py \
+#     --pretrained_model_name_or_path="stabilityai/sd-turbo" \
+#     --output_dir="output/cyclegan_turbo/day2night" \
+#     --dataset_folder "s3://sdagent-shard-bj-baiducloud/wheeljack/wuxiaolei/img_translation/data/e171_day_7322278_night_1706606_2024-12-18_all.json" \
+#     --train_img_prep "resize_286_randomcrop_256x256_hflip" --val_img_prep "no_resize" \
+#     --learning_rate="1e-5" --max_train_steps=25000 \
+#     --train_batch_size=1 --gradient_accumulation_steps=1 \
+#     --report_to "wandb" --tracker_project_name "gparmar_unpaired_h2z_cycle_debug_v2" \
+#     --enable_xformers_memory_efficient_attention --validation_steps 250 \
+#     --lambda_gan 0.5 --lambda_idt 1 --lambda_cycle 1
