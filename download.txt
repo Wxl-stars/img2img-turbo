@@ -1,0 +1,4 @@
+https://www.cs.cmu.edu/~img2img-turbo/models/day2night.pkl
+https://www.cs.cmu.edu/~img2img-turbo/models/night2day.pkl
+https://www.cs.cmu.edu/~img2img-turbo/models/clear2rainy.pkl
+https://www.cs.cmu.edu/~img2img-turbo/models/rainy2clear.pkl
