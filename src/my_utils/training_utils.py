@@ -144,7 +144,7 @@ def parse_args_unpaired_training():
     # args for validation and logging
     parser.add_argument("--viz_freq", type=int, default=20)
     parser.add_argument("--output_dir", type=str, required=True)
-    parser.add_argument("--num_keep_latest", type=int, default=5)
+    parser.add_argument("--num_keep_latest", type=int, default=10)
     parser.add_argument("--report_to", type=str, default="wandb")
     parser.add_argument("--tracker_project_name", type=str, required=True)
     parser.add_argument("--validation_steps", type=int, default=500,)
@@ -215,6 +215,12 @@ def build_transform(image_prep):
         ])
     elif image_prep == "no_resize":
         T = transforms.Lambda(lambda x: x)
+    elif image_prep == "keep_ratio":
+        T = transforms.Compose([
+            transforms.Resize((420, 840), interpolation=transforms.InterpolationMode.LANCZOS),  # Resize long side to 1024 while keeping aspect ratio
+            transforms.RandomCrop((416, 832)),  # Crop to 512x1024 while keeping the ratio
+            transforms.RandomHorizontalFlip(),  # Apply random horizontal flip
+        ])
     return T
 
 

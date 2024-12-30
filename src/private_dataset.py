@@ -40,7 +40,11 @@ class PrivateUnpairedDataset(UnpairedDataset):
 
     def _load_data_from_json(self):
         json_data = json.load(refile.smart_open(self.dataset_folder))
-        self.l_imgs_src = json_data["day"]
+        if "goodday" in json_data.keys():
+            self.l_imgs_src = json_data["goodday"]
+        else:
+            self.l_imgs_src = json_data["day"]
+
         if "good_night" in json_data.keys():
             self.l_imgs_tgt = json_data["good_night"]
         else:

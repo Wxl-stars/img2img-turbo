@@ -471,6 +471,7 @@ def main(args):
 
             progress_bar.set_postfix(**logs)
             accelerator.log(logs, step=global_step)
+            print(logs)
             if global_step >= args.max_train_steps:
                 break
 
